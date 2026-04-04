@@ -27,12 +27,16 @@ const LS = {
 };
 
 /* ── YouTube API ── */
-async function ytSearch(q, apiKey) {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=8&q=${encodeURIComponent(q)}&key=${apiKey}`;
+async function ytSearch(q, apiKey, pageToken = "") {
+  let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=20&q=${encodeURIComponent(q)}&key=${apiKey}`;
+  if (pageToken) url += `&pageToken=${pageToken}`;
   const r = await fetch(url);
   const d = await r.json();
   if (!r.ok) throw new Error(d.error?.message || "YouTube API 오류");
-  return (d.items || []).map((i) => i.snippet.channelId);
+  return {
+    ids: (d.items || []).map((i) => i.snippet.channelId),
+    nextPageToken: d.nextPageToken || null,
+  };
 }
 async function ytChannelStats(ids, apiKey) {
   const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&id=${ids.join(",")}&key=${apiKey}`;
@@ -161,25 +165,41 @@ export default function App() {
 }
 
 /* ════════════════ SEARCH TAB ════════════════ */
+const SUB_RANGES = [
+  { label: "전체", min: 0, max: Infinity },
+  { label: "~10K", min: 0, max: 10_000 },
+  { label: "10K~100K", min: 10_000, max: 100_000 },
+  { label: "100K~1M", min: 100_000, max: 1_000_000 },
+  { label: "1M+", min: 1_000_000, max: Infinity },
+];
+
 function SearchTab({ apiKey, keyOk, db, updateDB }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState("");
   const [insights, setInsights] = useState({});
   const [insightLoad, setInsightLoad] = useState({});
+  const [nextPage, setNextPage] = useState(null);
+  const [filterSubs, setFilterSubs] = useState(0);
+  const [filterCountry, setFilterCountry] = useState("");
+  const [sortBy, setSortBy] = useState("default");
 
-  const search = async () => {
+  const doSearch = async (append = false, pageToken = "") => {
     if (!q.trim() || !keyOk) return;
-    setLoading(true); setErr(""); setResults([]);
+    append ? setLoadingMore(true) : (setLoading(true), setErr(""), !append && setResults([]));
     try {
-      const ids = await ytSearch(q, apiKey);
-      if (!ids.length) { setErr("검색 결과가 없습니다."); setLoading(false); return; }
+      const { ids, nextPageToken } = await ytSearch(q, apiKey, pageToken);
+      if (!ids.length && !append) { setErr("검색 결과가 없습니다."); setLoading(false); return; }
       const stats = await ytChannelStats(ids, apiKey);
-      setResults(stats);
+      setResults((p) => append ? [...p, ...stats] : stats);
+      setNextPage(nextPageToken);
     } catch (e) { setErr(e.message); }
-    setLoading(false);
+    append ? setLoadingMore(false) : setLoading(false);
   };
+
+  const search = () => { setResults([]); setNextPage(null); doSearch(false, ""); };
 
   const getInsight = async (ch) => {
     setInsightLoad((p) => ({ ...p, [ch.channelId]: true }));
@@ -204,24 +224,75 @@ function SearchTab({ apiKey, keyOk, db, updateDB }) {
   const isAdded = (ch) => db.inf.find((x) => x.channelId === ch.channelId);
   const addToDB = (ch) => {
     if (isAdded(ch)) return;
-    const next = { ...db, inf: [{ ...ch, id: uid(), platform: "YouTube", addedAt: new Date().toISOString() }, ...db.inf] };
-    updateDB(next);
+    updateDB({ ...db, inf: [{ ...ch, id: uid(), platform: "YouTube", addedAt: new Date().toISOString() }, ...db.inf] });
   };
+
+  const range = SUB_RANGES[filterSubs];
+  const filtered = results
+    .filter((ch) => {
+      const s = parseInt(ch.subscribers || 0);
+      if (s < range.min || s > range.max) return false;
+      if (filterCountry && ch.country !== filterCountry) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (sortBy === "subs_desc") return parseInt(b.subscribers || 0) - parseInt(a.subscribers || 0);
+      if (sortBy === "subs_asc")  return parseInt(a.subscribers || 0) - parseInt(b.subscribers || 0);
+      if (sortBy === "views_desc") return parseInt(b.views || 0) - parseInt(a.views || 0);
+      return 0;
+    });
+
+  const countries = [...new Set(results.map((r) => r.country).filter(Boolean))];
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+      {/* Search bar */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
         <input value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && search()}
-          placeholder="채널명, 키워드 검색 (예: Korean beauty, fitness vlog, 먹방...)"
+          placeholder="채널명, 키워드 검색 (예: Korean beauty, fitness vlog, 먹방, gaming...)"
           style={{ ...S.input, flex: 1, fontSize: 14 }} />
         <button style={S.btn("primary")} onClick={search} disabled={!keyOk || loading}>
           {loading ? "검색 중..." : "검색"}
         </button>
       </div>
 
+      {/* Filters */}
+      {results.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center", padding: "10px 14px", background: "#f9f9f9", borderRadius: 10, border: "1px solid #ebebeb" }}>
+          <span style={{ fontSize: 11, color: "#bbb", fontWeight: 600 }}>필터</span>
+          {/* Subscriber filter */}
+          <div style={{ display: "flex", gap: 4 }}>
+            {SUB_RANGES.map((r, i) => (
+              <button key={r.label} onClick={() => setFilterSubs(i)}
+                style={{ padding: "4px 10px", borderRadius: 20, border: "1px solid " + (filterSubs === i ? "#111" : "#e0e0e0"), background: filterSubs === i ? "#111" : "#fff", color: filterSubs === i ? "#fff" : "#888", fontSize: 11, cursor: "pointer" }}>
+                {r.label}
+              </button>
+            ))}
+          </div>
+          {/* Country filter */}
+          {countries.length > 0 && (
+            <select value={filterCountry} onChange={(e) => setFilterCountry(e.target.value)}
+              style={{ padding: "4px 10px", borderRadius: 8, border: "1px solid #e0e0e0", background: "#fff", fontSize: 12, color: "#555", cursor: "pointer" }}>
+              <option value="">전체 국가</option>
+              {countries.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+          {/* Sort */}
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}
+            style={{ padding: "4px 10px", borderRadius: 8, border: "1px solid #e0e0e0", background: "#fff", fontSize: 12, color: "#555", cursor: "pointer", marginLeft: "auto" }}>
+            <option value="default">기본 순</option>
+            <option value="subs_desc">구독자 많은 순</option>
+            <option value="subs_asc">구독자 적은 순</option>
+            <option value="views_desc">조회수 많은 순</option>
+          </select>
+          <span style={{ fontSize: 11, color: "#bbb" }}>{filtered.length}개</span>
+        </div>
+      )}
+
       {err && <div style={{ color: "#ef4444", fontSize: 13, marginBottom: 16 }}>⚠ {err}</div>}
 
-      {results.map((ch) => (
+      {/* Results */}
+      {filtered.map((ch) => (
         <div key={ch.channelId} style={S.card}>
           <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
             {ch.thumb && <img src={ch.thumb} alt="" style={{ width: 52, height: 52, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} />}
@@ -234,7 +305,7 @@ function SearchTab({ apiKey, keyOk, db, updateDB }) {
               <p style={{ fontSize: 12, color: "#888", marginBottom: 12, lineHeight: 1.5, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
                 {ch.description || "설명 없음"}
               </p>
-              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
                 {[["구독자", fmt(ch.subscribers)], ["총 조회수", fmt(ch.views)], ["영상 수", parseInt(ch.videos || 0).toLocaleString() + "개"], ["예상 광고 단가", estimatePrice(ch.subscribers, ch.views)]].map(([l, v]) => (
                   <div key={l} style={S.stat}>
                     <div style={{ fontSize: 10, color: "#bbb", marginBottom: 2 }}>{l}</div>
@@ -254,12 +325,21 @@ function SearchTab({ apiKey, keyOk, db, updateDB }) {
           </div>
           {insights[ch.channelId] && (
             <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid #f0f0f0" }}>
-              <div style={{ fontSize: 11, color: "#bbb", marginBottom: 6, fontWeight: 600, letterSpacing: "0.05em" }}>AI 인사이트</div>
+              <div style={{ fontSize: 11, color: "#bbb", marginBottom: 6, fontWeight: 600 }}>AI 인사이트</div>
               <pre style={{ fontSize: 12, color: "#555", lineHeight: 1.8, whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>{insights[ch.channelId]}</pre>
             </div>
           )}
         </div>
       ))}
+
+      {/* Load more */}
+      {nextPage && !loading && (
+        <div style={{ textAlign: "center", marginTop: 16 }}>
+          <button style={{ ...S.btn(), padding: "10px 28px" }} onClick={() => doSearch(true, nextPage)} disabled={loadingMore}>
+            {loadingMore ? "불러오는 중..." : "결과 더 보기"}
+          </button>
+        </div>
+      )}
 
       {!loading && results.length === 0 && !err && (
         <div style={{ textAlign: "center", padding: "60px 0", color: "#ccc", fontSize: 13 }}>
